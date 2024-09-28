@@ -6,8 +6,8 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use lazy_regex::regex;
 use line_index::{LineIndex, TextSize, WideEncoding, WideLineCol};
+use pest::{iterators::Pairs, Parser as _, RuleType};
 use serde_json::{json, Value};
 use tower_lsp::{
     jsonrpc,
@@ -72,8 +72,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
                                 work_done_progress: None,
                             },
                             legend: SemanticTokensLegend {
-                                // MUST match the order in `enum TokenKind`, below
-                                token_types: vec![SemanticTokenType::KEYWORD],
+                                token_types: TokenKind::legend(),
                                 token_modifiers: vec![],
                             },
                             range: None,
@@ -172,18 +171,66 @@ impl tower_lsp::LanguageServer for LanguageServer {
             bail!("no such document with uri {}", uri)
         };
         ensure!(text.source.len() <= u32::MAX as usize);
-        // `\b` is a word boundary
-        let builder = regex!(r#"\b(zero|knowledge|proof)\b"#)
-            .find_iter(&text.source)
-            .filter_map(|matsh| {
-                let range = text.range(matsh.start(), matsh.end())?;
-                Some((range, TokenKind::Keyword))
-            })
-            .collect::<SemanticTokensBuilder>();
+        let mut builder = SemanticTokensBuilder::default();
+        colour_ast(
+            &mut builder,
+            text.offset_lookup(),
+            Grammar::parse(Rule::file, &text.source).map_err(conv_error)?,
+            |rule| {
+                Some(match rule {
+                    Rule::COMMENT => TokenKind::Comment,
+                    Rule::variable => TokenKind::Variable,
+                    Rule::prover_input_fn => TokenKind::Function,
+                    Rule::nullary_instruction => TokenKind::Keyword,
+                    Rule::conditional_block => TokenKind::Decorator,
+                    _ => return None,
+                })
+            },
+        );
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
             data: builder.data,
         })))
+    }
+}
+
+#[derive(pest_derive::Parser)]
+#[grammar = "grammar.pest"]
+struct Grammar;
+
+fn colour_ast<R: RuleType>(
+    builder: &mut SemanticTokensBuilder,
+    offset_lookup: &LineIndex,
+    ast: Pairs<'_, R>,
+    mut select: impl FnMut(R) -> Option<TokenKind>,
+) {
+    let offset2position = |offset: usize| {
+        let lc = offset_lookup.try_line_col(TextSize::try_from(offset).ok()?)?;
+        let WideLineCol { line, col } = offset_lookup.to_wide(WideEncoding::Utf16, lc)?;
+        Some(Position {
+            line,
+            character: col,
+        })
+    };
+    for pair in ast {
+        match select(pair.as_rule()) {
+            Some(token_kind) => {
+                let (start, end) = pair.as_span().split();
+                let (Some(start), Some(end)) =
+                    (offset2position(start.pos()), offset2position(end.pos()))
+                else {
+                    continue;
+                };
+                builder.push(Range { start, end }, token_kind);
+            }
+            None => colour_ast(
+                builder,
+                offset_lookup,
+                pair.into_inner(),
+                // no recursive cycle
+                &mut select as &mut dyn FnMut(_) -> _,
+            ),
+        }
     }
 }
 
@@ -195,43 +242,33 @@ struct SemanticTokensBuilder {
     data: Vec<SemanticToken>,
 }
 
-impl Extend<(Range, TokenKind)> for SemanticTokensBuilder {
-    fn extend<II: IntoIterator<Item = (Range, TokenKind)>>(&mut self, iter: II) {
-        for (range, token_kind) in iter {
-            let mut push_line = range.start.line;
-            let mut push_char = range.start.character;
+impl SemanticTokensBuilder {
+    fn push(&mut self, range: Range, token_kind: TokenKind) {
+        let mut push_line = range.start.line;
+        let mut push_char = range.start.character;
 
-            if !self.data.is_empty() {
-                push_line -= self.prev_line;
-                if push_line == 0 {
-                    push_char -= self.prev_char;
-                }
+        if !self.data.is_empty() {
+            push_line -= self.prev_line;
+            if push_line == 0 {
+                push_char -= self.prev_char;
             }
-
-            // A token cannot be multiline
-            let token_len = range.end.character - range.start.character;
-
-            let token = SemanticToken {
-                delta_line: push_line,
-                delta_start: push_char,
-                length: token_len,
-                token_type: token_kind as u32,
-                token_modifiers_bitset: 0,
-            };
-
-            self.data.push(token);
-
-            self.prev_line = range.start.line;
-            self.prev_char = range.start.character;
         }
-    }
-}
 
-impl FromIterator<(Range, TokenKind)> for SemanticTokensBuilder {
-    fn from_iter<II: IntoIterator<Item = (Range, TokenKind)>>(iter: II) -> Self {
-        let mut this = Self::default();
-        this.extend(iter);
-        this
+        // A token cannot be multiline
+        let token_len = range.end.character - range.start.character;
+
+        let token = SemanticToken {
+            delta_line: push_line,
+            delta_start: push_char,
+            length: token_len,
+            token_type: token_kind as u32,
+            token_modifiers_bitset: 0,
+        };
+
+        self.data.push(token);
+
+        self.prev_line = range.start.line;
+        self.prev_char = range.start.character;
     }
 }
 
@@ -251,34 +288,51 @@ impl SourceFile {
             offset_lookup: OnceCell::new(),
         }
     }
-    fn range(&self, start: usize, end: usize) -> Option<Range> {
-        let lookup = self.offset_lookup();
-        let offset2position = |offset: usize| {
-            let WideLineCol { line, col } = lookup.to_wide(
-                WideEncoding::Utf16,
-                lookup.line_col(TextSize::try_from(offset).ok()?),
-            )?;
-            Some(Position {
-                line,
-                character: col,
-            })
-        };
-        Some(Range {
-            start: offset2position(start)?,
-            end: offset2position(end)?,
-        })
-    }
     fn offset_lookup(&self) -> &LineIndex {
         self.offset_lookup
             .get_or_init(|| LineIndex::new(&self.source))
     }
 }
 
-/// Ordering MUST match the [`SemanticTokensLegend`] provided in [`tower_lsp::LanguageServer::initialize`].
+macro_rules! legend {
+    (
+        $(#[$enum_meta:meta])*
+        $vis:vis enum $ident:ident {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident = $token_type:expr
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        $vis enum $ident {
+            $(
+                $(#[$variant_meta])*
+                $variant,
+            )*
+        }
+
+        impl $ident {
+            /// The discriminant of this enum is used as an index
+            /// into itself given by [`Self::legend`].
+            fn legend() -> ::std::vec::Vec<::tower_lsp::lsp_types::SemanticTokenType> {
+                ::std::vec![
+                    $($token_type,)*
+                ]
+            }
+        }
+    };
+}
+
+legend! {
 #[repr(u32)]
 enum TokenKind {
-    Keyword,
-}
+    Comment = SemanticTokenType::COMMENT,
+    Keyword = SemanticTokenType::KEYWORD,
+    Function = SemanticTokenType::FUNCTION,
+    Decorator = SemanticTokenType::DECORATOR,
+    Variable = SemanticTokenType::VARIABLE,
+}}
 
 /// Accept [`anyhow::Error`] (`: !Error`) _and_ other error types.
 fn conv_error(e: impl Into<Box<dyn std::error::Error>>) -> jsonrpc::Error {
