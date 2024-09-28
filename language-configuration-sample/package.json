@@ -13,13 +13,13 @@
   "contributes": {
     "languages": [
       {
-        "id": "javascript",
+        "id": "lavascript",
         "extensions": [
-          ".js"
+          ".ls"
         ],
         "aliases": [
-          "js",
-          "JavaScript"
+          "ls",
+          "LavaScript"
         ],
         "configuration": "./language-configuration.json"
       }
