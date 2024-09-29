@@ -7,7 +7,9 @@
 			"request": "launch",
 			"name": "Launch Client",
 			"runtimeExecutable": "${execPath}",
-			"args": ["--extensionDevelopmentPath=${workspaceRoot}"],
+			"args": [
+				"--extensionDevelopmentPath=${workspaceRoot}"
+			],
 			"outFiles": [
 				"${workspaceRoot}/client/out/**/*.js",
 				"${workspaceRoot}/server/out/**/*.js"
@@ -15,7 +17,7 @@
 			"autoAttachChildProcesses": true,
 			"preLaunchTask": {
 				"type": "npm",
-				"script": "watch"
+				"script": "compile"
 			}
 		},
 		{
@@ -28,7 +30,9 @@
 				"--extensionTestsPath=${workspaceRoot}/client/out/test/index",
 				"${workspaceRoot}/client/testFixture"
 			],
-			"outFiles": ["${workspaceRoot}/client/out/test/**/*.js"]
+			"outFiles": [
+				"${workspaceRoot}/client/out/test/**/*.js"
+			]
 		}
 	]
 }

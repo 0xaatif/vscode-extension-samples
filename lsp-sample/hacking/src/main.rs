@@ -221,11 +221,8 @@ fn colour_ast<R: RuleType>(
                 // Going via TextSize is more reliable than through pest::Span::lines_span
                 let offset = TextSize::new(pair.as_span().start().try_into().unwrap());
                 let len = TextSize::of(pair.as_str());
-                for mut text_range in source.offset_lookup().lines(TextRange::at(offset, len)) {
-                    if source.string[text_range].ends_with('\n') {
-                        text_range =
-                            TextRange::new(text_range.start(), text_range.end() - TextSize::new(1))
-                    }
+                for text_range in source.offset_lookup().lines(TextRange::at(offset, len)) {
+                    let text_range = trim_end(text_range, &source.string, "\n");
                     let (Some(start), Some(end)) = (
                         offset2position(text_range.start()),
                         offset2position(text_range.end()),
@@ -243,6 +240,13 @@ fn colour_ast<R: RuleType>(
                 &mut select as &mut dyn FnMut(_) -> _,
             ),
         }
+    }
+}
+
+fn trim_end(text_range: TextRange, str: &str, end: &str) -> TextRange {
+    match str[text_range].ends_with(end) {
+        true => TextRange::new(text_range.start(), text_range.end() - TextSize::of(end)),
+        false => text_range,
     }
 }
 
